@@ -1,3 +1,4 @@
+/* eslint-disable max-lines -- the one Better Auth configuration: every hook and plugin lives here */
 import { env } from "cloudflare:workers";
 import { betterAuth } from "better-auth";
 import {
@@ -16,7 +17,7 @@ import * as pgSchema from "@/db/pg/schema";
 import { getDatabaseProvider } from "@/db/provider";
 import { z } from "zod";
 import { CURRENT_TERMS_VERSION } from "@/shared/terms";
-import { isHostedAuthMode } from "@/lib/auth-mode";
+import { getAuthMode, isHostedAuthMode, usesBetterAuth } from "@/lib/auth-mode";
 import { createApiKeyPlugin } from "@/lib/auth-api-key";
 import { getActiveOrganizationId } from "@/lib/auth-session";
 import { createBaseAuthConfig } from "@/lib/auth-config";
@@ -27,8 +28,13 @@ import {
 import { resolveSignInHostedOrganization } from "@/server/auth/default-hosted-organization";
 import { onInvitationAccepted } from "@/server/auth/invited-member";
 import { AuthRepository } from "@/server/auth/repositories/AuthRepository";
+import { assertStandaloneSignUpOpen } from "@/server/standalone/sign-up";
 import { captureDubReferralSignup } from "@/server/referrals/dub";
-import { captureMetaSignup } from "@/server/referrals/meta";
+import {
+  captureMetaSetupStep,
+  captureMetaSignup,
+  MetaSetupEvent,
+} from "@/server/referrals/meta";
 import {
   captureSignUpCompleted,
   saveSignUpCampaign,
@@ -37,7 +43,9 @@ import {
   productUpdatesOnByDefault,
   requestPrivacyChoices,
 } from "@/shared/privacy-choices";
-import { markOnboardingMilestone } from "@/server/email/onboarding-drip";
+import { markMcpConnected } from "@/server/features/activation/mcpActivation";
+import { assertNotScheduledForDeletion } from "@/server/account-deletion/signInBlock";
+import { claimGuestFromCookie } from "@/server/auth/guest-accounts";
 import {
   sendHostedPasswordResetEmail,
   sendHostedVerificationEmail,
@@ -51,22 +59,34 @@ const hostedBaseUrlSchema = z
     const url = new URL(value);
     return (
       url.protocol === "https:" ||
-      (url.protocol === "http:" && url.hostname === "localhost")
+      (url.protocol === "http:" &&
+        ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname))
     );
-  }, "BETTER_AUTH_URL must use https or localhost");
+  }, "BETTER_AUTH_URL must use https or a loopback host");
 
-const createdApiKeySchema = z.object({ referenceId: z.string() });
+const createdApiKeySchema = z.object({
+  referenceId: z.string(),
+  // Bound by the api-key/create before hook.
+  metadata: z.looseObject({ organizationId: z.string().min(1) }),
+});
 
 function createAuth() {
-  // Hosted needs the real configured URL (cookies, callbacks, /api/auth routes
-  // all use it). Self-hosted only builds this instance to mint/refresh Search
-  // Console tokens, which never read baseURL — so a placeholder is fine there.
-  const baseUrl = isHostedAuthMode(env.AUTH_MODE)
+  // Modes with their own accounts need the real configured URL (cookies,
+  // callbacks, /api/auth routes all use it). The other self-hosted modes only
+  // build this instance to mint/refresh Search Console tokens, which never
+  // read baseURL — so a placeholder is fine there.
+  const baseUrl = usesBetterAuth(env.AUTH_MODE)
     ? getHostedBaseUrl()
     : "http://localhost";
-  const bypassEmail = Reflect.get(env, "BYPASS_EMAIL_VERIFICATION") === "true";
+  // Password mode (self-hosted accounts: the Docker standalone edition and the
+  // Cloudflare self-host) has no email transport: accounts come from the
+  // first visit, invitation links, or the operator's commands
+  // (src/server/standalone/admin.ts), so nothing is ever verified by email.
+  const standalone = getAuthMode(env.AUTH_MODE) === "password";
+  const bypassEmail =
+    standalone || Reflect.get(env, "BYPASS_EMAIL_VERIFICATION") === "true";
   const baseAuthConfig = createBaseAuthConfig(
-    isHostedAuthMode(env.AUTH_MODE)
+    usesBetterAuth(env.AUTH_MODE)
       ? {
           organization: {
             // No sendInvitationEmail here on purpose: better-auth swallows a
@@ -178,17 +198,34 @@ function createAuth() {
       },
     },
     ...baseAuthConfig,
+    // Standalone reads every session from the database so an operator
+    // password reset revokes it at once; hosted keeps the signed-cookie cache
+    // (see auth-options.ts for the trade-off).
+    session: standalone
+      ? { ...baseAuthConfig.session, cookieCache: { enabled: false } }
+      : baseAuthConfig.session,
+    // Better Auth turns its rate limiter on only when NODE_ENV is
+    // "production", which the standalone runtime does not set, so password
+    // guessing against /sign-in/email was unlimited there. The memory store
+    // is enough: the runtime keeps the app alive between requests.
+    ...(standalone ? { rateLimit: { enabled: true } } : {}),
     emailAndPassword: {
       ...baseAuthConfig.emailAndPassword,
       requireEmailVerification: !bypassEmail,
       resetPasswordTokenExpiresIn: 60 * 60,
       revokeSessionsOnPasswordReset: true,
-      sendResetPassword: async ({ user, url }) => {
-        await sendHostedPasswordResetEmail({
-          email: user.email,
-          resetUrl: url,
-        });
-      },
+      // Standalone: the operator's create-user call must not mint a session
+      // for anyone, and there is no email to carry a reset link.
+      ...(standalone
+        ? { autoSignIn: false }
+        : {
+            sendResetPassword: async ({ user, url }) => {
+              await sendHostedPasswordResetEmail({
+                email: user.email,
+                resetUrl: url,
+              });
+            },
+          }),
     },
     emailVerification: bypassEmail
       ? undefined
@@ -213,7 +250,7 @@ function createAuth() {
     database,
     plugins: [
       ...baseAuthConfig.plugins,
-      ...(isHostedAuthMode(env.AUTH_MODE) ? [createApiKeyPlugin()] : []),
+      ...(usesBetterAuth(env.AUTH_MODE) ? [createApiKeyPlugin()] : []),
       ...(turnstileSecretKey
         ? [
             captcha({
@@ -226,18 +263,22 @@ function createAuth() {
       tanstackStartCookies(),
     ],
     hooks: {
-      // Binds a new MCP API key to the organization the session is working
-      // in, server-side: the /mcp handler reads metadata.organizationId and
-      // bills/authorizes that org for the key's lifetime. The session's
-      // active org is only a hint; the member row is the authorization fact.
-      // Throwing here means an unbound key can never be minted through the
-      // HTTP endpoint. Better Auth merges the returned body over the
-      // request's, so an organizationId the client sends loses to this one.
-      // The owner can still rewrite metadata through /api-key/update, which
-      // gains nothing: a key pointed at an org they are not in fails the
-      // membership check on its next /mcp call, and one pointed at an org
-      // they are in is no different from a key created there.
       before: createAuthMiddleware(async (ctx) => {
+        // Standalone closes registration (src/server/standalone/sign-up.ts).
+        if (standalone && ctx.path === "/sign-up/email")
+          return assertStandaloneSignUpOpen(ctx.headers, ctx.body);
+
+        // Binds a new MCP API key to the organization the session is working
+        // in, server-side: the /mcp handler reads metadata.organizationId and
+        // bills/authorizes that org for the key's lifetime. The session's
+        // active org is only a hint; the member row is the authorization fact.
+        // Throwing here means an unbound key can never be minted through the
+        // HTTP endpoint. Better Auth merges the returned body over the
+        // request's, so an organizationId the client sends loses to this one.
+        // The owner can still rewrite metadata through /api-key/update, which
+        // gains nothing: a key pointed at an org they are not in fails the
+        // membership check on its next /mcp call, and one pointed at an org
+        // they are in is no different from a key created there.
         if (ctx.path !== "/api-key/create") return;
         // Minting a credential must see the stored session, not the cookie
         // cache: a cookie from a session revoked minutes ago must not mint a
@@ -265,13 +306,18 @@ function createAuth() {
         if (ctx.path !== "/api-key/create") return;
         const created = createdApiKeySchema.safeParse(ctx.context.returned);
         if (!created.success) return;
-        const user = await AuthRepository.getHostedUser(
-          created.data.referenceId,
-        );
+        const { referenceId, metadata } = created.data;
+        const user = await AuthRepository.getHostedUser(referenceId);
         if (!user) return;
-        await markOnboardingMilestone(
-          { userId: user.id, userEmail: user.email },
-          "mcpConnected",
+        await markMcpConnected({
+          userId: user.id,
+          userEmail: user.email,
+          organizationId: metadata.organizationId,
+        });
+        await captureMetaSetupStep(
+          MetaSetupEvent.AgentConnected,
+          metadata.organizationId,
+          ctx.request,
         );
       }),
     },
@@ -311,8 +357,8 @@ function createAuth() {
             };
           },
           after: async (user, ctx) => {
-            await syncHostedSignupContact(user);
             if (isHostedAuthMode(env.AUTH_MODE)) {
+              await syncHostedSignupContact(user);
               // Partner attribution is a referral choice: an older dub_id
               // cookie must not credit a partner without it.
               if (requestPrivacyChoices(ctx?.request).referrals) {
@@ -332,15 +378,21 @@ function createAuth() {
       },
       session: {
         create: {
-          before: async (session) => {
-            // Runs on every sign-in (each sign-in mints a session row).
-            // Resolution order: last-active org while still a member → most
-            // recently joined org → newly created default organization —
-            // except that a membership-less user with a pending invitation
-            // gets no organization minted (null active org) so accepting the invite
-            // leaves them in exactly the inviter's org. Inject Better Auth's
-            // createOrganization so the helper can stay reusable without
-            // importing auth.ts and creating a cycle.
+          before: async (session, ctx) => {
+            // Runs on every sign-in (each sign-in mints a session row). Refuses
+            // an account waiting to be deleted, claims a guest account whose
+            // claim link this browser opened (its org then counts as a
+            // membership below), then resolves the active org:
+            // last-active org while still a member → most recently joined → a
+            // new default one — except a membership-less user with a pending
+            // invitation gets none (null active org), so accepting leaves them
+            // in exactly the inviter's org. createOrganization is injected so
+            // the helper needn't import auth.ts and create a cycle.
+            await assertNotScheduledForDeletion(session.userId);
+            await claimGuestFromCookie(
+              ctx?.request?.headers ?? ctx?.headers,
+              session.userId,
+            );
             const resolved = await resolveSignInHostedOrganization(
               session.userId,
               (body) => auth.api.createOrganization({ body }),
@@ -404,7 +456,7 @@ export function getHostedBaseUrl() {
   const baseUrl = env.BETTER_AUTH_URL?.trim();
 
   if (!baseUrl) {
-    throw new Error("BETTER_AUTH_URL is required in hosted mode");
+    throw new Error("BETTER_AUTH_URL is required in hosted and password modes");
   }
 
   return hostedBaseUrlSchema.parse(baseUrl);
@@ -476,10 +528,14 @@ function hasHostedAuthEmailConfig() {
   });
 }
 
-export function hasHostedAuthConfig() {
+// Whether this deployment can serve its own accounts. Standalone needs only
+// the URL and the secret; hosted also needs Google sign-in, Turnstile, and
+// (unless bypassed) the transactional email templates.
+export function hasBetterAuthConfig() {
   try {
     getHostedBaseUrl();
     getHostedSecret();
+    if (getAuthMode(env.AUTH_MODE) === "password") return true;
     getGoogleSocialProviderConfig();
     return (
       hasHostedTurnstileConfig(env) &&

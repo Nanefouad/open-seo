@@ -55,6 +55,42 @@ export const userSignupCampaigns = sqliteTable("user_signup_campaigns", {
   utmContent: text("utm_content"),
 });
 
+// A guest account created when someone connects an AI agent over MCP without
+// signing up (src/server/auth/guest-accounts.ts). The row outlives the guest
+// user on purpose: user_id is not a foreign key, so claiming or deleting the
+// guest keeps the row, and the per-IP guest limit keeps counting it. ip_hash
+// is a keyed hash of the client IP, never the raw address.
+export const guestAccounts = sqliteTable(
+  "guest_accounts",
+  {
+    userId: text("user_id").primaryKey(),
+    ipHash: text("ip_hash").notNull(),
+    // Random secret behind the guest's "create your account" link, which
+    // hands the guest's organization to whoever signs in with it.
+    claimToken: text("claim_token").notNull().unique(),
+    createdAt: text("created_at").notNull(),
+  },
+  (table) => [index("guest_accounts_ip_hash_idx").on(table.ipHash)],
+);
+
+// A self-serve account deletion the user asked for. Sign-in is blocked while
+// the row exists; the daily cron erases the account once deleteAfter passes
+// (src/server/account-deletion). Both timestamps are ISO strings written by
+// the app, so they compare the same way on both dialects.
+export const accountDeletionRequests = sqliteTable(
+  "account_deletion_requests",
+  {
+    userId: text("user_id")
+      .primaryKey()
+      .references(() => user.id, { onDelete: "cascade" }),
+    requestedAt: text("requested_at").notNull(),
+    deleteAfter: text("delete_after").notNull(),
+  },
+  (table) => [
+    index("account_deletion_requests_delete_after_idx").on(table.deleteAfter),
+  ],
+);
+
 // Projects for keyword research
 export const projects = sqliteTable(
   "projects",
@@ -64,6 +100,8 @@ export const projects = sqliteTable(
       .notNull()
       .references(() => organization.id, { onDelete: "cascade" }),
     name: text("name").notNull(),
+    // The name AI visibility looks for in answers. Null uses the project name.
+    brandName: text("brand_name"),
     domain: text("domain"),
     // Default DataForSEO location/language for the project, set during
     // onboarding and reused by every project-scoped data call.
@@ -407,14 +445,17 @@ export const organizationActivationState = sqliteTable(
 );
 
 // Per-project state for the dashboard's onboarding checklist. Most steps
-// complete via real product state (projects.domain, gsc_connections, MCP
-// activation); the competitor and keyword steps complete on click-through.
+// complete via real product state (audits, teammates, MCP activation). The
+// competitor and keyword steps record the first domain overview or keyword
+// research run on the project, from the app or an agent; the column names
+// predate that. The checklist counts a step done on any of the workspace's
+// projects.
 export const projectActivationState = sqliteTable("project_activation_state", {
   projectId: text("project_id")
     .primaryKey()
     .references(() => projects.id, { onDelete: "cascade" }),
-  competitorStepClickedAt: text("competitor_step_clicked_at"),
-  keywordStepClickedAt: text("keyword_step_clicked_at"),
+  competitorResearchedAt: text("competitor_step_clicked_at"),
+  keywordResearchedAt: text("keyword_step_clicked_at"),
   // "I already connected" on the MCP card: hides the card for this project
   // without faking the org-level first-tool-call milestone, which stays
   // truthful and self-heals when a real external call lands.
