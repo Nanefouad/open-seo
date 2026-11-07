@@ -10,7 +10,12 @@ import { mcpResponse } from "@/server/mcp/formatters";
 import { optionalMetaOutputSchema } from "@/server/mcp/output-schemas";
 import { withMcpProjectAuth } from "@/server/mcp/project-auth";
 import { projectIdSchema } from "@/server/mcp/schemas";
-import { buildConnectGscUrl } from "@/server/mcp/urls";
+import {
+  buildConnectGscUrl,
+  buildDashboardUrl,
+  buildGuestSignUpUrl,
+  GUEST_SIGN_UP_NOTE,
+} from "@/server/mcp/urls";
 
 // MCP counterparts of the dashboard's "pick a Search Console property / GA4
 // property" screens, so an agent can finish project setup after the user has
@@ -98,7 +103,7 @@ export const listSearchConsoleSitesTool = {
     const connectUrl = buildConnectGscUrl(
       context.baseUrl,
       args.projectId,
-      context.auth.guestClaimToken,
+      Boolean(context.auth.guestClaimToken),
     );
     const [siteList, connection] = await Promise.all([
       GscService.listSitesForUserWithGrantStatus(context.auth.userId),
@@ -129,7 +134,10 @@ export const listSearchConsoleSitesTool = {
                 ),
               ].join("\n"),
             )
-            .join("\n");
+            .join("\n") +
+          (accounts.every((grant) => grant.sites.length === 0)
+            ? `\nNo Search Console property is available from these accounts. The user can reconnect Google or connect another account here: ${connectUrl}`
+            : "");
     return mcpResponse({
       text,
       meta: buildProjectMeta(context, args.projectId),
@@ -250,9 +258,12 @@ export const listGoogleAnalyticsPropertiesTool = {
           connection.propertyId === property.propertyId,
       })),
     }));
+    const integrationsPath = `/p/${args.projectId}/settings/integrations`;
     const text =
       accounts.length === 0
-        ? "No Google account with Google Analytics access is connected to this OpenSEO user. Connect one on the project's Integrations page in the dashboard."
+        ? context.auth.guestClaimToken
+          ? `No Google account with Google Analytics access is connected to this OpenSEO user. Connecting one needs a full OpenSEO account, which the user can create (or sign in to) here: ${buildGuestSignUpUrl(context.baseUrl, integrationsPath)}. ${GUEST_SIGN_UP_NOTE}`
+          : `No Google account with Google Analytics access is connected to this OpenSEO user. Connect one here: ${buildDashboardUrl(context.baseUrl, integrationsPath)}`
         : accounts
             .map((grant) =>
               [
